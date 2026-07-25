@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
-HPL-AI Mixed-Precision Benchmark — Python / TTNN implementation.
+HPL-AI Mixed-Precision Benchmark — Python implementation, CPU/GPU/TTNN backends.
 
 Host  (Python + NumPy + SciPy, fp32/fp64):
   matgen / vecgen, panel factorization (_sgetrf2_nopiv),
-  block-row strsm, initial triangular solve, GMRES.
+  initial triangular solve, GMRES — identical on all three backends.
 
-Device (Tenstorrent Tensix via TTNN):
-  Block-row strsm in sgetrf_nopiv (U12 = L11_inv @ A12)         — fp32.
-  Trailing sgemm in sgetrf_nopiv  (A22 -= A21 @ U12)            — bf16.
+--device cpu (default):
+  Blocked LU (sgetrf_nopiv_cpu) runs entirely on host, fp32 — a direct port
+  of the C reference's sgetrf_nopiv/strsm/sgemm (blas.c, sgetrf_nopiv.c).
+  No torch/ttnn dependency, no accelerator required.
+
+--device gpu:
+  Blocked LU (sgetrf_nopiv_gpu) offloads to a CUDA GPU via PyTorch:
+  Block-row strsm and trailing sgemm both run as torch.matmul on-device,
+  fp32 throughout. Requires torch built with CUDA support.
+
+--device ttnn:
+  Blocked LU (sgetrf_nopiv_ttnn) offloads to a Tenstorrent Tensix via TTNN:
+  Block-row strsm in sgetrf_nopiv_ttnn (U12 = L11_inv @ A12)     — fp32.
+  Trailing sgemm in sgetrf_nopiv_ttnn  (A22 -= A21 @ U12)        — bf16.
 
 Run with --help for CLI usage.
 """
@@ -101,9 +112,131 @@ def _sgetrf2_nopiv(A: np.ndarray) -> None:
     _sgetrf2_nopiv(A[n1:, n1:])
 
 
-# ─── Blocked LU: host panel + device strsm + device sgemm ───────────────────
+# ─── Blocked LU ───────────────────────────────────────────────────────────────
 
 NB = 32   # block size == Tensix tile dimension — exact match, no padding needed
+
+
+def sgetrf_nopiv_cpu(A: np.ndarray) -> dict[str, float]:
+    """
+    Blocked LU without pivoting, in-place on A (n×n numpy fp32 array).
+
+    Direct port of the C reference's sgetrf_nopiv (sgetrf_nopiv.c) with its
+    strsm/sgemm (blas.c) inlined as NumPy/SciPy calls — host-only, fp32,
+    nb=32. No device offload; this is the CPU baseline.
+
+    Per block column j:
+      Panel factorization (_sgetrf2_nopiv) : fp32 — serial recursive, (N-j)×32
+      Block-row strsm  U12 = L11^-1 * A12  : fp32 — triangular solve, matches C strsm
+      Trailing sgemm   A22 -= A21 @ U12    : fp32 — dominant O(N^3) cost
+
+    Returns a dict of accumulated wall-clock seconds per phase.
+    """
+    tm = dict(panel=0.0, strsm=0.0, sgemm=0.0)
+    _t = time.perf_counter
+
+    n = A.shape[0]
+    for j in range(0, n, NB):
+        jb = min(NB, n - j)
+
+        # ── panel factorization ───────────────────────────────────────────
+        t0 = _t(); _sgetrf2_nopiv(A[j:, j:j+jb]); tm["panel"] += _t() - t0
+
+        if j + jb >= n:
+            break
+
+        # ── block-row strsm: L11 * U12 = A12 ──────────────────────────────
+        t0 = _t()
+        A[j:j+jb, j+jb:] = scipy.linalg.solve_triangular(
+            A[j:j+jb, j:j+jb], A[j:j+jb, j+jb:], lower=True, unit_diagonal=True,
+        )
+        tm["strsm"] += _t() - t0
+
+        # ── trailing sgemm: A22 -= A21 @ U12 ──────────────────────────────
+        t0 = _t()
+        A[j+jb:, j+jb:] -= A[j+jb:, j:j+jb] @ A[j:j+jb, j+jb:]
+        tm["sgemm"] += _t() - t0
+
+    return tm
+
+def _to_cuda(arr: np.ndarray, device) -> "torch.Tensor":
+    """numpy → contiguous fp32 torch tensor on a CUDA device."""
+    t = torch.from_numpy(np.ascontiguousarray(arr))
+    return t.to(device=device, dtype=torch.float32)
+
+
+def _from_cuda(t: "torch.Tensor") -> np.ndarray:
+    """CUDA torch tensor → numpy (fp32). .cpu() is the sync point (d2h)."""
+    return t.cpu().numpy()
+
+
+def sgetrf_nopiv_gpu(A: np.ndarray, device) -> dict[str, float]:
+    """
+    Blocked LU without pivoting, in-place on A (n×n numpy fp32 array).
+
+    Same block structure as sgetrf_nopiv_ttnn, offloaded to a CUDA GPU via
+    PyTorch instead of a Tenstorrent Tensix via TTNN.
+
+    Per block column j:
+      Panel factorization (_sgetrf2_nopiv) : host, fp32   — serial recursive, (N-j)×32
+      L11_inv                              : host, fp32   — invert the 32×32 pivot block
+      Block-row strsm as matmul            : DEVICE, fp32 — U12 = L11_inv @ A12
+      Trailing sgemm                       : DEVICE, fp32 — A22 -= A21 @ U12 (dominant O(N³))
+
+    Unlike the TTNN path, CUDA fp32 matmul handles both operations natively
+    in the same dtype, so there's no need for a bf16 round-trip of U12 —
+    strsm and sgemm both stay fp32 and U12 can go straight from the strsm
+    output into the sgemm input without leaving the device.
+
+    Returns a dict of accumulated wall-clock seconds per phase.
+    Note: CUDA kernel launches are async; device compute time that overlaps
+    with subsequent host work surfaces in the d2h measurement (.cpu() blocks
+    until the device drains). The strsm/sgemm buckets therefore capture
+    dispatch latency only — d2h absorbs the remaining device execution time.
+    """
+    tm = dict(panel=0.0, inv=0.0, h2d=0.0, strsm=0.0, sgemm=0.0, d2h=0.0)
+    _t = time.perf_counter
+
+    n = A.shape[0]
+    for j in range(0, n, NB):
+        jb        = min(NB, n - j)
+        remaining = max(0, n - j - jb)
+
+        # ── panel factorization (host) ────────────────────────────────────
+        t0 = _t(); _sgetrf2_nopiv(A[j:, j:j+jb]); tm["panel"] += _t() - t0
+
+        if remaining == 0:
+            break
+
+        # ── invert pivot block on host (32×32, negligible cost) ──────────
+        t0 = _t()
+        L11 = np.tril(A[j:j+jb, j:j+jb].copy()).astype(np.float32)
+        np.fill_diagonal(L11, 1.0)
+        L11_inv = scipy.linalg.inv(L11)
+        tm["inv"] += _t() - t0
+
+        # ── host → device transfers (fp32 throughout) ─────────────────────
+        t0 = _t()
+        L11_inv_t = _to_cuda(L11_inv,              device)
+        A12_t     = _to_cuda(A[j:j+jb, j+jb:],     device)
+        A21_t     = _to_cuda(A[j+jb:, j:j+jb],     device)
+        A22_t     = _to_cuda(A[j+jb:, j+jb:],      device)
+        tm["h2d"] += _t() - t0
+
+        # ── block-row strsm (device, fp32): U12 = L11_inv @ A12 ──────────
+        t0 = _t(); U12_t = L11_inv_t @ A12_t; tm["strsm"] += _t() - t0
+
+        # ── trailing sgemm (device, fp32): A22 -= A21 @ U12 ───────────────
+        t0 = _t(); A22_t = A22_t - A21_t @ U12_t; tm["sgemm"] += _t() - t0
+
+        # ── device → host write-back (.cpu() blocks until device drains) ──
+        t0 = _t()
+        A[j:j+jb, j+jb:] = _from_cuda(U12_t)
+        A[j+jb:,  j+jb:] = _from_cuda(A22_t)
+        tm["d2h"] += _t() - t0
+
+    return tm
+
 
 def _to_tt(arr: np.ndarray, device, dtype=None) -> "ttnn.Tensor":
     """numpy → contiguous torch → TTNN tile-layout tensor on device.
@@ -126,7 +259,7 @@ def _from_tt(tt: "ttnn.Tensor") -> np.ndarray:
     return ttnn.to_torch(tt).to(torch.float32).numpy()
 
 
-def sgetrf_nopiv(A: np.ndarray, device) -> dict[str, float]:
+def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
     """
     Blocked LU without pivoting, in-place on A (n×n numpy fp32 array).
 
@@ -256,7 +389,10 @@ def gmres(
     not Python scalar loops.
 
     Returns {"outer": int, "inner": int, "converged": bool,
-             "max_outer": int, "max_inner": int}.
+             "max_outer": int, "max_inner": int, "residual_initial": float,
+             "iters": list[tuple[int, float]]}.
+    "iters" holds the (iteration, estimated_residual) trace printed during
+    the inner Krylov loop, for callers that want it without reparsing stdout.
     """
     m      = min(restart, n)
     norm_b = np.linalg.norm(b) or 1.0
@@ -266,13 +402,18 @@ def gmres(
     outer_done = 0
     inner_done = 0
     converged  = False
+    iters: list[tuple[int, float]] = []
 
-    r     = _precond(LU, b - A @ x)
-    error = np.linalg.norm(r) / norm_b
+    r      = _precond(LU, b - A @ x)
+    error  = np.linalg.norm(r) / norm_b
+    residual_initial = error
     print(f"Residual norm at beginning of GMRES: {error:.6e}")
     if error < tol:
         converged = True
-        return dict(outer=0, inner=0, converged=True, max_outer=max_it, max_inner=m)
+        return dict(
+            outer=0, inner=0, converged=True, max_outer=max_it, max_inner=m,
+            residual_initial=residual_initial, iters=iters,
+        )
 
     for _outer in range(max_it):
         outer_done = _outer + 1
@@ -316,6 +457,7 @@ def gmres(
             H[i+1, i]    = 0.0
 
             gmres_err = abs(s[i+1]) / norm_b
+            iters.append((i + 1, gmres_err))
             print(f"  GMRES iter {i+1:3d}: estimated residual = {gmres_err:.6e}")
 
             if gmres_err <= tol:
@@ -356,6 +498,7 @@ def gmres(
     return dict(
         outer=outer_done, inner=inner_done,
         converged=converged, max_outer=max_it, max_inner=m,
+        residual_initial=residual_initial, iters=iters,
     )
 
 
@@ -371,17 +514,48 @@ def _load_raw_f64(path: str, expected_size: int | None = None) -> np.ndarray:
     return v
 
 
+def _fmt_metric(v) -> str:
+    """Render one metric value for the machine-readable block.
+
+    Floats use %.10g (fixed or scientific, whichever is shorter) so every
+    value round-trips through float() without depending on column width or
+    trailing-zero padding. Bools render as 1/0, matching the rest of the
+    key=value block being plain numbers.
+    """
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return f"{v:.10g}"
+    return str(v)
+
+
+def _write_machine_readable(metrics: dict, path: str) -> None:
+    """Write metrics as one `key=value` pair per line to `path`.
+
+    Written in addition to (not instead of) the human-readable report on
+    stdout — same run, same numbers, just also available in a file a script
+    can load without touching stdout or reparsing the pretty formatting.
+    File is plain `key=value` lines only, nothing else — trivially parsed
+    with e.g. `dict(line.strip().split("=", 1) for line in open(path))`.
+    """
+    with open(path, "w") as f:
+        for k, v in metrics.items():
+            f.write(f"{k}={_fmt_metric(v)}\n")
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="hpl_ai_ttnn.py",
-        description="HPL-AI mixed-precision benchmark (Python / TTNN).",
+        prog="hpl-ai.py",
+        description="HPL-AI mixed-precision benchmark (Python, CPU/GPU/TTNN backend).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  hpl_ai_ttnn.py                          run with defaults (N=100, MAX_IT=50)
-  hpl_ai_ttnn.py 500 40                   N=500, MAX_IT=40, matrix/vector generated
-  hpl_ai_ttnn.py --input-a A.bin          N inferred from A.bin, b generated
-  hpl_ai_ttnn.py --input-a A.bin --input-b b.bin
+  hpl-ai.py                               run with defaults (N=100, MAX_IT=50, CPU)
+  hpl-ai.py 500 40                        N=500, MAX_IT=40, matrix/vector generated
+  hpl-ai.py --device gpu 500 40           same, LU factorization offloaded to CUDA
+  hpl-ai.py --device ttnn 500 40          same, LU factorization offloaded to TTNN
+  hpl-ai.py --input-a A.bin               N inferred from A.bin, b generated
+  hpl-ai.py --input-a A.bin --input-b b.bin
                                            both A and b loaded from file
 
 --input-a/--input-b files are headerless raw binary: contiguous native-endian
@@ -399,6 +573,16 @@ plain fwrite/fread on either side, with no format translation.""",
         help="GMRES restart length (default: 50), capped at N-1.",
     )
     parser.add_argument(
+        "--device", choices=["cpu", "gpu", "ttnn"], default="cpu",
+        help="backend for the LU factorization (default: cpu). "
+             "'cpu' runs entirely on host (NumPy/SciPy, fp32), no accelerator "
+             "required. 'gpu' offloads block-row strsm and the trailing "
+             "sgemm to a CUDA GPU via PyTorch, fp32 (requires torch built "
+             "with CUDA support). 'ttnn' offloads the same two ops to a "
+             "Tenstorrent Tensix via TTNN, fp32/bf16 (requires torch/ttnn "
+             "and a device at device_id=0).",
+    )
+    parser.add_argument(
         "--input-a", type=str, default=None, metavar="FILE",
         help="raw binary file: N*N float64 values, row-major. "
              "Overrides matgen(); N is inferred from the file size.",
@@ -409,6 +593,12 @@ plain fwrite/fread on either side, with no format translation.""",
              "Overrides vecgen(); if omitted, b is still generated so you "
              "can pair a fixed A with a generated b.",
     )
+    parser.add_argument(
+        "--metrics-file", type=str, default="hpl-ai-metrics.txt", metavar="FILE",
+        help="path to write machine-readable key=value metrics to "
+             "(default: hpl-ai-metrics.txt in the current directory). "
+             "Overwritten each run; not printed to stdout.",
+    )
     args = parser.parse_args()
 
     if args.input_b and not args.input_a:
@@ -418,18 +608,39 @@ plain fwrite/fread on either side, with no format translation.""",
 
 
 def main() -> None:
+    # Declared once, unconditionally: CPython rejects a `global` statement
+    # for a name that's already been *used* earlier in the function body,
+    # even when that use sits in a different (mutually exclusive) branch.
+    global torch, ttnn
+
     args  = _parse_args()
     iseed = 1
 
     print("=" * 78)
-    print("         HPL-AI Mixed-Precision Benchmark  [Python / TTNN]")
+    print("              HPL-AI Mixed-Precision Benchmark  [Python]")
     print("=" * 78)
+    backend_label = {
+        "cpu":  "CPU (NumPy/SciPy)",
+        "gpu":  "GPU (PyTorch/CUDA)",
+        "ttnn": "TTNN (Tenstorrent Tensix)",
+    }[args.device]
+    print(f"Backend: {backend_label}")
 
-    global torch, ttnn
-    import torch
-    import ttnn
+    device = None
+    if args.device == "gpu":
+        import torch
 
-    device = ttnn.open_device(device_id=0)
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "--device gpu requires a CUDA-capable GPU, but "
+                "torch.cuda.is_available() is False."
+            )
+        device = torch.device("cuda")
+    elif args.device == "ttnn":
+        import torch
+        import ttnn
+
+        device = ttnn.open_device(device_id=0)
 
     # ── Load A and b from file, or generate (fp64) ───────────────────────────
     if args.input_a:
@@ -456,9 +667,14 @@ def main() -> None:
     t_c1  = time.perf_counter() - t0
     print(f"Time: conversion to single      {1e3 * t_c1:12.3f} ms")
 
-    # ── LU factorization (fp32, device strsm + sgemm) ───────────────────────
-    t0       = time.perf_counter()
-    lu_tm    = sgetrf_nopiv(sA, device)
+    # ── LU factorization (fp32; host-only on cpu, strsm+sgemm offloaded on gpu/ttnn) ─
+    t0 = time.perf_counter()
+    if args.device == "gpu":
+        lu_tm = sgetrf_nopiv_gpu(sA, device)
+    elif args.device == "ttnn":
+        lu_tm = sgetrf_nopiv_ttnn(sA, device)
+    else:
+        lu_tm = sgetrf_nopiv_cpu(sA)
     t_factor = time.perf_counter() - t0
 
     lu_sum = sum(lu_tm.values())   # should ≈ t_factor
@@ -470,12 +686,18 @@ def main() -> None:
         print(f"  {connector} {label:<38s} {ms:{_W}.3f} ms  ({pct:5.1f}%)")
 
     print(f"Time: LU factorization          {1e3 * t_factor:{_W}.3f} ms")
-    _lu_row("panel  _sgetrf2_nopiv  (host)",  "panel")
-    _lu_row("inv    L11⁻¹ 32×32     (host)",  "inv")
-    _lu_row("h2d    host → device   (PCIe)",  "h2d")
-    _lu_row("strsm  U12=L11⁻¹·A12  (device)", "strsm")
-    _lu_row("sgemm  A22-=A21·U12   (device)", "sgemm")
-    _lu_row("d2h    device → host   (PCIe)",  "d2h",  connector="└─")
+    if args.device in ("gpu", "ttnn"):
+        dev_label = "CUDA" if args.device == "gpu" else "TTNN"
+        _lu_row("panel  _sgetrf2_nopiv  (host)",         "panel")
+        _lu_row("inv    L11⁻¹ 32×32     (host)",         "inv")
+        _lu_row("h2d    host → device   (PCIe)",         "h2d")
+        _lu_row(f"strsm  U12=L11⁻¹·A12  ({dev_label})",  "strsm")
+        _lu_row(f"sgemm  A22-=A21·U12   ({dev_label})",  "sgemm")
+        _lu_row("d2h    device → host   (PCIe)",         "d2h",  connector="└─")
+    else:
+        _lu_row("panel  sgetrf2_nopiv  (host)",  "panel")
+        _lu_row("strsm  U12=L11⁻¹·A12 (host)",   "strsm")
+        _lu_row("sgemm  A22-=A21·U12  (host)",   "sgemm", connector="└─")
 
     # ── Initial triangular solve (fp32, host) ─────────────────────────────────
     t0      = time.perf_counter()
@@ -520,9 +742,46 @@ def main() -> None:
     print()
     print("||Ax-b||_oo / ( eps * ( ||x||_oo * ||A||_oo + ||b||_oo ) * N )")
     print(f"eps = {eps:.6e}")
-    print(f"Scaled residual = {error:.6f}  ...", "PASSED" if error < 16.0 else "FAILED")
+    passed = bool(error < 16.0)
+    print(f"Scaled residual = {error:.6f}  ...", "PASSED" if passed else "FAILED")
 
-    ttnn.close_device(device)
+    # ── Machine-readable summary (same numbers, key=value form) ──────────────
+    metrics = {
+        "device": args.device,
+        "n": n,
+        "max_it": max_it,
+        "nb": NB,
+        "time_convert_single_ms": 1e3 * t_c1,
+        "time_lu_factorization_ms": 1e3 * t_factor,
+    }
+    for key, secs in lu_tm.items():
+        metrics[f"lu_{key}_ms"] = 1e3 * secs
+        metrics[f"lu_{key}_pct"] = 100.0 * secs / lu_sum if lu_sum > 0 else 0.0
+    metrics.update({
+        "time_triangular_solve_ms": 1e3 * t_solve,
+        "time_convert_double_ms": 1e3 * t_c2,
+        "gmres_residual_initial": gm["residual_initial"],
+    })
+    for i, res in gm["iters"]:
+        metrics[f"gmres_iter_{i}_residual"] = res
+    metrics.update({
+        "time_gmres_ms": 1e3 * t_gmres,
+        "gmres_converged": gm["converged"],
+        "gmres_outer_iterations": gm["outer"],
+        "gmres_max_outer_iterations": gm["max_outer"],
+        "gmres_inner_iterations": gm["inner"],
+        "gmres_max_inner_iterations": gm["max_inner"],
+        "time_total_ms": 1e3 * t_total,
+        "gflops": 1e-9 * ops / t_total,
+        "eps": eps,
+        "scaled_residual": error,
+        "scaled_residual_passed": passed,
+    })
+    _write_machine_readable(metrics, args.metrics_file)
+    print(f"\nMachine-readable metrics written to: {args.metrics_file}")
+
+    if args.device == "ttnn":
+        ttnn.close_device(device)
 
 
 if __name__ == "__main__":
