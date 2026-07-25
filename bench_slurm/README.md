@@ -49,6 +49,15 @@ python3 run_bench.py --target tt --sizes-file sizes_example.txt --dry-run
 python3 run_bench.py --target tt --sizes-file sizes_example.txt \
     --setup-cmd "source /path/to/other_tt_environment"
 
+# Get an email when each job starts/ends (omit --mail-user for no mail at all)
+python3 run_bench.py --target tt --sizes-file sizes_example.txt \
+    --mail-user you@gatech.edu
+
+# Force a cold ttnn run by wiping the kernel/build cache before the sweep
+# (rm -rf DIR — only added to the 'tt' target's script)
+python3 run_bench.py --target tt --sizes-file sizes_example.txt \
+    --clean-tt ~/.cache/tenstorrent
+
 # Re-summarize an existing output folder by hand (also runs automatically
 # at the end of each job)
 python3 run_bench.py --summarize runs/bench_20260101_120000/cpu
@@ -82,13 +91,33 @@ The environment setup command runs once, near the top of the generated
 sbatch script, before the benchmark loop — pass `--setup-cmd` to override
 it for all targets in a given invocation.
 
+### `--clean-tt DIR`
+
+If given, the `tt` target's generated script runs `rm -rf -- DIR` right
+after environment setup and before the benchmark loop starts — e.g. to
+force a cold run by wiping a ttnn kernel/build cache directory rather than
+reusing whatever's already compiled there (see
+[bench_tt_cold_start](../bench_tt_cold_start/) for why that distinction
+matters for ttnn timings). It's ignored (with a warning printed at
+generation time) if `tt` isn't one of the targets in that invocation, since
+there'd be no script to put it in. Rejected outright — before any script is
+even written — if `DIR` resolves to an empty string, `/`, or your home
+directory, as a guard against an obviously catastrophic `rm -rf`; this
+isn't a substitute for double-checking the path yourself.
+
 Every job additionally gets:
 
 ```
 #SBATCH --time=0-24:00:00
 #SBATCH --output={outdir}/slurm_%j.out
+```
+
+plus, only if `--mail-user EMAIL` was given (no mail directives, and no
+mail sent, if it's omitted):
+
+```
 #SBATCH --mail-type=BEGIN,END
-#SBATCH --mail-user=hlim325@gatech.edu
+#SBATCH --mail-user=EMAIL
 ```
 
 (SLURM directives aren't cumulative — separate `--mail-type=BEGIN` and

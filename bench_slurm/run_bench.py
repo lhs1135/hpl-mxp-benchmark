@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import subprocess
 import sys
@@ -62,13 +63,10 @@ SBATCH_DEVICE_LINES = {
             "--gres=r5accel:p150a:1"],
 }
 
-# Common to every backend. Note: SLURM directives aren't cumulative — two
-# separate `--mail-type=` lines would have the second silently win, not
-# combine — so BEGIN/END are merged into one line here.
+# Common to every backend. Mail directives are added conditionally in
+# build_sbatch_script, only when --mail-user is given (see there).
 SBATCH_COMMON_LINES = [
     "--time=0-24:00:00",
-    "--mail-type=BEGIN,END",
-    "--mail-user=hlim325@gatech.edu",
 ]
 
 # Per-backend environment setup, run before the benchmark loop inside the
@@ -83,6 +81,20 @@ DEFAULT_RUNS_DIR = Path(__file__).resolve().parent / "runs"
 DEFAULT_HPL_AI = Path(__file__).resolve().parent.parent / "hpl-ai.py"
 
 _METRICS_FILENAME_RE = re.compile(r"^(cpu|gpu|tt)_(\d+)_(\d+)\.txt$")
+
+
+def _is_unsafe_clean_dir(path: str) -> bool:
+    """Guard against obviously catastrophic --clean-tt targets.
+
+    Not exhaustive (this is `rm -rf` on a user-supplied path — there's no
+    way to make that fully foolproof) but catches the easy ways to nuke
+    the wrong thing: empty string, "/", and the home directory itself
+    (cleaning something *under* home is fine and the whole point of the
+    option; cleaning home itself is not).
+    """
+    resolved = os.path.abspath(os.path.expanduser(path.strip())) if path.strip() else ""
+    home = os.path.abspath(os.path.expanduser("~"))
+    return resolved in ("", "/", home)
 
 
 def parse_sizes_file(path: str) -> list[tuple[int, int]]:
@@ -114,6 +126,8 @@ def build_sbatch_script(
     hpl_ai_script: Path,
     this_script: Path,
     setup_cmd: str,
+    mail_user: str | None,
+    clean_tt_dir: str | None,
 ) -> str:
     lines = ["#!/bin/bash"]
     lines.append(f"#SBATCH --job-name=hplai_{target}")
@@ -122,6 +136,12 @@ def build_sbatch_script(
     for l in SBATCH_COMMON_LINES:
         lines.append(f"#SBATCH {l}")
     lines.append(f"#SBATCH --output={outdir}/slurm_%j.out")
+    if mail_user:
+        # Merged into one --mail-type line: SLURM directives aren't
+        # cumulative, so separate BEGIN/END lines would have the second
+        # silently win instead of combining.
+        lines.append("#SBATCH --mail-type=BEGIN,END")
+        lines.append(f"#SBATCH --mail-user={mail_user}")
     lines.append("")
     lines.append("set -uo pipefail  # no -e: one failed run must not abort the whole sweep")
     lines.append("")
@@ -135,6 +155,12 @@ def build_sbatch_script(
             "or none given via --setup-cmd)."
         )
     lines.append("")
+
+    if target == "tt" and clean_tt_dir:
+        lines.append("# --- clean tt cache before this sweep (--clean-tt) ---")
+        lines.append(f'echo "Cleaning tt cache dir: {clean_tt_dir}"')
+        lines.append(f'rm -rf -- "{clean_tt_dir}"')
+        lines.append("")
 
     lines.append(f'OUTDIR="{outdir}"')
     lines.append('mkdir -p "$OUTDIR"')
@@ -261,6 +287,19 @@ def _parse_args() -> argparse.Namespace:
              "invocation. Inserted verbatim, once per generated script.",
     )
     parser.add_argument(
+        "--mail-user", type=str, default=None, metavar="EMAIL",
+        help="email address for SLURM job-start/job-end notifications "
+             "(--mail-type=BEGIN,END --mail-user=EMAIL). If omitted, no "
+             "mail directives are added and SLURM sends no mail.",
+    )
+    parser.add_argument(
+        "--clean-tt", type=str, default=None, metavar="DIR",
+        help="if given, `rm -rf DIR` before the tt sweep starts (e.g. a "
+             "ttnn kernel/build cache directory, to force a cold run). "
+             "Only added to the 'tt' target's generated script; ignored "
+             "(with a warning) if 'tt' isn't in --target.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="write the generated sbatch script(s) but don't submit them.",
     )
@@ -278,6 +317,11 @@ def _parse_args() -> argparse.Namespace:
         for t in args.target.split(","):
             if t.strip() not in VALID_TARGETS:
                 parser.error(f"invalid --target {t.strip()!r}; choose from {VALID_TARGETS}")
+        if args.clean_tt is not None and _is_unsafe_clean_dir(args.clean_tt):
+            parser.error(
+                f"--clean-tt {args.clean_tt!r} looks unsafe (empty, '/', or "
+                "your home directory) — refusing to generate `rm -rf` for it"
+            )
 
     return args
 
@@ -303,6 +347,10 @@ def main() -> None:
     base = Path(args.output_dir).resolve() if args.output_dir else DEFAULT_RUNS_DIR
     batch_dir = base / f"bench_{stamp}"
 
+    if args.clean_tt is not None and "tt" not in targets:
+        print(f"warning: --clean-tt {args.clean_tt!r} given but 'tt' is not in "
+              f"--target ({targets}); ignored.", file=sys.stderr)
+
     print(f"Problem sizes ({len(sizes)}): {sizes}")
     print(f"Iterations per size: {args.iterations}")
     print(f"Output folder: {batch_dir}\n")
@@ -314,7 +362,7 @@ def main() -> None:
         setup_cmd = args.setup_cmd if args.setup_cmd is not None else DEFAULT_SETUP_CMDS[target]
         script_text = build_sbatch_script(
             target, sizes, args.iterations, outdir, hpl_ai_script, this_script,
-            setup_cmd,
+            setup_cmd, args.mail_user, args.clean_tt,
         )
         sbatch_path = outdir / "submit.sbatch"
         sbatch_path.write_text(script_text)
