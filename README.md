@@ -71,12 +71,17 @@ HPL-AI's C reference, so a given seed produces a bit-identical `A`/`b`.
 
 `gpu` and `ttnn` share the same block structure (panel → invert pivot →
 host↔device transfer → device strsm → device sgemm → transfer back), timed
-identically. They differ in that `ttnn`'s sgemm operands go to bf16 for
-Tensix throughput — which forces a bf16 round-trip of `U12` through the host
-since it's also needed fp32 for the write-back — while `gpu`'s CUDA matmul
-stays fp32 throughout with no such round-trip. See the docstrings on
-`sgetrf_nopiv_cpu`, `sgetrf_nopiv_gpu`, and `sgetrf_nopiv_ttnn` in
-`hpl-ai.py` for the exact per-block-column breakdown.
+identically except that `ttnn` has one extra step: its sgemm operands go to
+bf16 for Tensix throughput, so the fp32 `U12` produced by strsm needs a
+bf16 copy to feed it. That copy is made with `ttnn.typecast`, which
+converts dtype on-device (no PCIe hop) — verified against the installed
+ttnn build with [test_ttnn_typecast.py](test_ttnn_typecast.py) before being
+wired in, since neither the API's existence nor its exact signature could
+be confirmed from this dev environment (no local ttnn install). `gpu`'s
+CUDA matmul needs no such step; it stays fp32 throughout. See the
+docstrings on `sgetrf_nopiv_cpu`, `sgetrf_nopiv_gpu`, and
+`sgetrf_nopiv_ttnn` in `hpl-ai.py` for the exact per-block-column
+breakdown.
 
 ## Output
 
@@ -109,9 +114,11 @@ Scaled residual = X.XXXXXX  ... PASSED
 Machine-readable metrics written to: hpl-ai-metrics.txt
 ```
 
-(`--device gpu`/`ttnn` print a six-row breakdown — panel, pivot-block
-invert, host→device, device strsm, device sgemm, device→host — instead of
-the three-row host-only breakdown above.)
+(`--device gpu` prints a six-row breakdown instead — panel, pivot-block
+invert, host→device, device strsm, device sgemm, device→host. `--device
+ttnn` prints a seventh row between strsm and sgemm for the on-device
+fp32→bf16 cast of `U12`. Both replace the three-row host-only breakdown
+above.)
 
 The final scaled-residual check mirrors the C reference: `PASSED` if the
 result is below the threshold of 16.0.

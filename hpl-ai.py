@@ -19,7 +19,9 @@ Host  (Python + NumPy + SciPy, fp32/fp64):
 --device ttnn:
   Blocked LU (sgetrf_nopiv_ttnn) offloads to a Tenstorrent Tensix via TTNN:
   Block-row strsm in sgetrf_nopiv_ttnn (U12 = L11_inv @ A12)     — fp32.
-  Trailing sgemm in sgetrf_nopiv_ttnn  (A22 -= A21 @ U12)        — bf16.
+  Trailing sgemm in sgetrf_nopiv_ttnn  (A22 -= A21 @ U12)        — bf16,
+  fed by an on-device ttnn.typecast of U12 (fp32 -> bf16, no PCIe hop —
+  see test_ttnn_typecast.py).
 
 Run with --help for CLI usage.
 """
@@ -272,23 +274,20 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
     strsm stays fp32 because U12 is written back into A and seeds the next
     block column's panel factorization — precision lost there compounds
     across columns, not just within one trailing update. sgemm's operands
-    (A21, A22) go bf16 for throughput; since a single ttnn.matmul call is
-    assumed to require same-dtype operands (unverified against the locally
-    uninstalled TTNN API — safer not to rely on implicit mixed-dtype
-    handling), a bf16 copy of U12 is round-tripped through the host
-    (_from_tt then _to_tt) solely to feed sgemm, while the original fp32
-    U12 remains what's written back to A. That round-trip reintroduces the
-    PCIe hop that keeping U12 on device was otherwise avoiding — a
-    deliberate trade of one extra host↔device hop per block column for
-    verified same-dtype matmul calls.
+    (A21, A22) go bf16 for throughput, so a bf16 copy of U12 is needed to
+    feed it; that copy is made with ttnn.typecast, which converts dtype
+    on-device (no PCIe hop) — confirmed against the installed ttnn build
+    via test_ttnn_typecast.py (numerically identical to a host round-trip,
+    just without the transfer). The original fp32 U12_tt is untouched by
+    the cast and remains what's written back to A.
 
     Returns a dict of accumulated wall-clock seconds per phase.
     Note: TTNN dispatch may be async; device compute time that overlaps with
     subsequent host work surfaces in the d2h measurement (to_torch blocks until
-    the device drains). The strsm/sgemm buckets therefore capture dispatch
+    the device drains). The strsm/cast/sgemm buckets therefore capture dispatch
     latency only — d2h absorbs the remaining device execution time.
     """
-    tm = dict(panel=0.0, inv=0.0, h2d=0.0, strsm=0.0, sgemm=0.0, d2h=0.0)
+    tm = dict(panel=0.0, inv=0.0, h2d=0.0, strsm=0.0, cast=0.0, sgemm=0.0, d2h=0.0)
     _t = time.perf_counter   # local alias to shorten call sites
 
     n = A.shape[0]
@@ -320,14 +319,12 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
         # ── block-row strsm (device, fp32): U12 = L11_inv @ A12 ──────────
         t0 = _t(); U12_tt = ttnn.matmul(L11_inv_tt, A12_tt); tm["strsm"] += _t() - t0
 
-        # ── round-trip a bf16 copy of U12 for sgemm only; fp32 U12 stays
-        #    authoritative for the write-back below ────────────────────────
+        # ── on-device cast: bf16 copy of U12 for sgemm only, no PCIe hop.
+        #    fp32 U12_tt is untouched and stays authoritative for the
+        #    write-back below ─────────────────────────────────────────────
         t0 = _t()
-        U12_host = _from_tt(U12_tt).astype(np.float32)
-        tm["d2h"] += _t() - t0
-        t0 = _t()
-        U12_bf16_tt = _to_tt(U12_host, device, dtype=ttnn.bfloat16)
-        tm["h2d"] += _t() - t0
+        U12_bf16_tt = ttnn.typecast(U12_tt, ttnn.bfloat16)
+        tm["cast"] += _t() - t0
 
         # ── trailing sgemm (device, bf16): A22 -= A21 @ U12 ───────────────
         t0 = _t()
@@ -337,7 +334,7 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
 
         # ── device → host write-back (blocks until device drains) ─────────
         t0 = _t()
-        A[j:j+jb, j+jb:] = U12_host   # fp32, unchanged precision
+        A[j:j+jb, j+jb:] = _from_tt(U12_tt).astype(np.float32)   # fp32, unchanged precision
         A[j+jb:,  j+jb:] = _from_tt(A22_out).astype(np.float32)
         tm["d2h"] += _t() - t0
 
@@ -686,14 +683,21 @@ def main() -> None:
         print(f"  {connector} {label:<38s} {ms:{_W}.3f} ms  ({pct:5.1f}%)")
 
     print(f"Time: LU factorization          {1e3 * t_factor:{_W}.3f} ms")
-    if args.device in ("gpu", "ttnn"):
-        dev_label = "CUDA" if args.device == "gpu" else "TTNN"
-        _lu_row("panel  _sgetrf2_nopiv  (host)",         "panel")
-        _lu_row("inv    L11⁻¹ 32×32     (host)",         "inv")
-        _lu_row("h2d    host → device   (PCIe)",         "h2d")
-        _lu_row(f"strsm  U12=L11⁻¹·A12  ({dev_label})",  "strsm")
-        _lu_row(f"sgemm  A22-=A21·U12   ({dev_label})",  "sgemm")
-        _lu_row("d2h    device → host   (PCIe)",         "d2h",  connector="└─")
+    if args.device == "ttnn":
+        _lu_row("panel  _sgetrf2_nopiv  (host)",  "panel")
+        _lu_row("inv    L11⁻¹ 32×32     (host)",  "inv")
+        _lu_row("h2d    host → device   (PCIe)",  "h2d")
+        _lu_row("strsm  U12=L11⁻¹·A12  (TTNN)",   "strsm")
+        _lu_row("cast   U12 fp32→bf16  (TTNN)",   "cast")
+        _lu_row("sgemm  A22-=A21·U12   (TTNN)",   "sgemm")
+        _lu_row("d2h    device → host   (PCIe)",  "d2h",  connector="└─")
+    elif args.device == "gpu":
+        _lu_row("panel  _sgetrf2_nopiv  (host)",  "panel")
+        _lu_row("inv    L11⁻¹ 32×32     (host)",  "inv")
+        _lu_row("h2d    host → device   (PCIe)",  "h2d")
+        _lu_row("strsm  U12=L11⁻¹·A12  (CUDA)",   "strsm")
+        _lu_row("sgemm  A22-=A21·U12   (CUDA)",   "sgemm")
+        _lu_row("d2h    device → host   (PCIe)",  "d2h",  connector="└─")
     else:
         _lu_row("panel  sgetrf2_nopiv  (host)",  "panel")
         _lu_row("strsm  U12=L11⁻¹·A12 (host)",   "strsm")
