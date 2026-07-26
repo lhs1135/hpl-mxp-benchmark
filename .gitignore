@@ -5,4 +5,5 @@
 *.csv
 *.txt
 **/generated/
+**/results/
 **/runs/
