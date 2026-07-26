@@ -23,12 +23,21 @@ Host  (Python + NumPy + SciPy, fp32/fp64):
   fed by an on-device ttnn.typecast of U12 (fp32 -> bf16, no PCIe hop —
   see test_ttnn_typecast.py).
 
+  --core-grid-mode {default,max,custom} controls the ttnn.CoreGrid passed
+  to both matmul calls above: 'default' (ttnn's own unconfigured choice,
+  the original behavior), 'max' (the full device grid), or 'custom'
+  (--core-grid-x/--core-grid-y). See _resolve_core_grid and
+  core_grid_experiment/Report.md — an unconfigured core grid is the
+  leading suspect for most of the 49-310x TT-vs-GPU gap this benchmark has
+  shown, not a real hardware ceiling.
+
 Run with --help for CLI usage.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 
 import numpy as np
@@ -240,6 +249,53 @@ def sgetrf_nopiv_gpu(A: np.ndarray, device) -> dict[str, float]:
     return tm
 
 
+# This deployment's Blackhole device.compute_with_storage_grid_size() —
+# see core_grid_experiment/Report.md / tt_matmul.py, where the full grid
+# was found this size. Used only as a fallback if querying the device
+# directly (the normal path for --core-grid-mode max) fails.
+KNOWN_MAX_CORE_GRID = (11, 10)  # (x, y)
+
+
+def _resolve_core_grid(ttnn_mod, device, mode: str, x: int | None, y: int | None):
+    """Returns a ttnn.CoreGrid for --device ttnn matmul calls, or None.
+
+    None means "don't pass core_grid to ttnn.matmul at all" — ttnn's own
+    unconfigured default, i.e. sgetrf_nopiv_ttnn's original behavior before
+    this option existed. See core_grid_experiment/Report.md: that default
+    path is the leading suspect for most of the 49-310x TT-vs-GPU gap seen
+    in this solver, as opposed to a real hardware throughput ceiling — the
+    'max'/'custom' modes exist to test that directly against the real
+    solver workload (not just an isolated matmul microbenchmark).
+
+      'default' : None (see above).
+      'max'     : the full device grid, queried via
+                  device.compute_with_storage_grid_size(); falls back to
+                  KNOWN_MAX_CORE_GRID with a warning if that query fails.
+      'custom'  : exactly (x, y) as given (both required).
+    """
+    if mode == "default":
+        return None
+    if mode == "custom":
+        if x is None or y is None:
+            raise ValueError(
+                "--core-grid-mode custom requires both --core-grid-x and --core-grid-y"
+            )
+        return ttnn_mod.CoreGrid(y=y, x=x)
+    if mode == "max":
+        try:
+            grid = device.compute_with_storage_grid_size()
+            gx, gy = grid.x, grid.y
+        except Exception as e:
+            gx, gy = KNOWN_MAX_CORE_GRID
+            print(
+                f"Warning: device.compute_with_storage_grid_size() failed ({e}); "
+                f"falling back to this deployment's known grid {gx}x{gy}.",
+                file=sys.stderr,
+            )
+        return ttnn_mod.CoreGrid(y=gy, x=gx)
+    raise ValueError(f"unknown core-grid mode {mode!r}")
+
+
 def _to_tt(arr: np.ndarray, device, dtype=None) -> "ttnn.Tensor":
     """numpy → contiguous torch → TTNN tile-layout tensor on device.
 
@@ -261,7 +317,7 @@ def _from_tt(tt: "ttnn.Tensor") -> np.ndarray:
     return ttnn.to_torch(tt).to(torch.float32).numpy()
 
 
-def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
+def sgetrf_nopiv_ttnn(A: np.ndarray, device, core_grid=None) -> dict[str, float]:
     """
     Blocked LU without pivoting, in-place on A (n×n numpy fp32 array).
 
@@ -281,6 +337,13 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
     just without the transfer). The original fp32 U12_tt is untouched by
     the cast and remains what's written back to A.
 
+    core_grid: optional ttnn.CoreGrid passed to both ttnn.matmul calls (see
+    _resolve_core_grid / --core-grid-mode in main()). None (the default)
+    reproduces the original, unconfigured behavior — ttnn picks its own
+    core grid per call. See core_grid_experiment/Report.md: that default
+    path is the leading suspect for most of the 49-310x TT-vs-GPU gap seen
+    in this solver's benchmark, not a real hardware ceiling.
+
     Returns a dict of accumulated wall-clock seconds per phase.
     Note: TTNN dispatch may be async; device compute time that overlaps with
     subsequent host work surfaces in the d2h measurement (to_torch blocks until
@@ -289,6 +352,7 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
     """
     tm = dict(panel=0.0, inv=0.0, h2d=0.0, strsm=0.0, cast=0.0, sgemm=0.0, d2h=0.0)
     _t = time.perf_counter   # local alias to shorten call sites
+    matmul_kwargs = {"core_grid": core_grid} if core_grid is not None else {}
 
     n = A.shape[0]
     for j in range(0, n, NB):
@@ -317,7 +381,9 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
         tm["h2d"] += _t() - t0
 
         # ── block-row strsm (device, fp32): U12 = L11_inv @ A12 ──────────
-        t0 = _t(); U12_tt = ttnn.matmul(L11_inv_tt, A12_tt); tm["strsm"] += _t() - t0
+        t0 = _t()
+        U12_tt = ttnn.matmul(L11_inv_tt, A12_tt, **matmul_kwargs)
+        tm["strsm"] += _t() - t0
 
         # ── on-device cast: bf16 copy of U12 for sgemm only, no PCIe hop.
         #    fp32 U12_tt is untouched and stays authoritative for the
@@ -328,7 +394,7 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device) -> dict[str, float]:
 
         # ── trailing sgemm (device, bf16): A22 -= A21 @ U12 ───────────────
         t0 = _t()
-        update  = ttnn.matmul(A21_tt, U12_bf16_tt)
+        update  = ttnn.matmul(A21_tt, U12_bf16_tt, **matmul_kwargs)
         A22_out = ttnn.subtract(A22_tt, update)
         tm["sgemm"] += _t() - t0
 
@@ -551,6 +617,10 @@ examples:
   hpl-ai.py 500 40                        N=500, MAX_IT=40, matrix/vector generated
   hpl-ai.py --device gpu 500 40           same, LU factorization offloaded to CUDA
   hpl-ai.py --device ttnn 500 40          same, LU factorization offloaded to TTNN
+  hpl-ai.py --device ttnn --core-grid-mode max 500 40
+                                           TTNN, matmuls pinned to the full device core grid
+  hpl-ai.py --device ttnn --core-grid-mode custom --core-grid-x 8 --core-grid-y 8 500 40
+                                           TTNN, matmuls pinned to an 8x8 core grid
   hpl-ai.py --input-a A.bin               N inferred from A.bin, b generated
   hpl-ai.py --input-a A.bin --input-b b.bin
                                            both A and b loaded from file
@@ -580,6 +650,25 @@ plain fwrite/fread on either side, with no format translation.""",
              "and a device at device_id=0).",
     )
     parser.add_argument(
+        "--core-grid-mode", choices=["default", "max", "custom"], default="default",
+        help="ttnn core grid selection for --device ttnn's matmul calls "
+             "(default: 'default' — ttnn's own unconfigured choice, the "
+             "original behavior; see core_grid_experiment/Report.md for why "
+             "this is worth changing). 'max' pins the full device compute "
+             f"grid (queried via the device, falling back to "
+             f"{KNOWN_MAX_CORE_GRID[0]}x{KNOWN_MAX_CORE_GRID[1]} — this "
+             "deployment's known grid — if that query fails). 'custom' uses "
+             "--core-grid-x/--core-grid-y. Ignored for --device cpu/gpu.",
+    )
+    parser.add_argument(
+        "--core-grid-x", type=int, default=None, metavar="X",
+        help="core grid width, required with --core-grid-mode custom.",
+    )
+    parser.add_argument(
+        "--core-grid-y", type=int, default=None, metavar="Y",
+        help="core grid height, required with --core-grid-mode custom.",
+    )
+    parser.add_argument(
         "--input-a", type=str, default=None, metavar="FILE",
         help="raw binary file: N*N float64 values, row-major. "
              "Overrides matgen(); N is inferred from the file size.",
@@ -600,6 +689,15 @@ plain fwrite/fread on either side, with no format translation.""",
 
     if args.input_b and not args.input_a:
         parser.error("--input-b requires --input-a")
+
+    if args.core_grid_mode == "custom" and (args.core_grid_x is None or args.core_grid_y is None):
+        parser.error("--core-grid-mode custom requires both --core-grid-x and --core-grid-y")
+    if args.core_grid_mode != "default" and args.device != "ttnn":
+        print(
+            f"warning: --core-grid-mode {args.core_grid_mode!r} given but "
+            f"--device is {args.device!r}, not ttnn — ignored.",
+            file=sys.stderr,
+        )
 
     return args
 
@@ -624,6 +722,7 @@ def main() -> None:
     print(f"Backend: {backend_label}")
 
     device = None
+    core_grid = None
     if args.device == "gpu":
         import torch
 
@@ -638,6 +737,11 @@ def main() -> None:
         import ttnn
 
         device = ttnn.open_device(device_id=0)
+        core_grid = _resolve_core_grid(
+            ttnn, device, args.core_grid_mode, args.core_grid_x, args.core_grid_y
+        )
+        grid_label = f"{core_grid.x}x{core_grid.y}" if core_grid is not None else "ttnn default (unconfigured)"
+        print(f"Core grid mode: {args.core_grid_mode} ({grid_label})")
 
     # ── Load A and b from file, or generate (fp64) ───────────────────────────
     if args.input_a:
@@ -669,7 +773,7 @@ def main() -> None:
     if args.device == "gpu":
         lu_tm = sgetrf_nopiv_gpu(sA, device)
     elif args.device == "ttnn":
-        lu_tm = sgetrf_nopiv_ttnn(sA, device)
+        lu_tm = sgetrf_nopiv_ttnn(sA, device, core_grid=core_grid)
     else:
         lu_tm = sgetrf_nopiv_cpu(sA)
     t_factor = time.perf_counter() - t0
@@ -755,6 +859,8 @@ def main() -> None:
         "n": n,
         "max_it": max_it,
         "nb": NB,
+        "core_grid_mode": args.core_grid_mode if args.device == "ttnn" else "",
+        "core_grid": (f"{core_grid.x}x{core_grid.y}" if core_grid is not None else "auto"),
         "time_convert_single_ms": 1e3 * t_c1,
         "time_lu_factorization_ms": 1e3 * t_factor,
     }
