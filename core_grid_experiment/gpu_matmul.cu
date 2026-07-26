@@ -89,11 +89,24 @@ struct Row {
   double d2h_gbps;
 };
 
-static void bench_size(int size, std::vector<Row>& rows) {
+// Writes one row immediately and flushes -- called right after each
+// measurement instead of accumulating into a vector that only gets written
+// out once the whole sweep finishes. A run that dies partway (OOM-killed,
+// SLURM time limit, etc.) still leaves every row measured before the crash
+// on disk. flush() is enough to survive the process being killed (the OS page
+// cache holds the bytes independent of the process); it would not survive a
+// hard power loss, which would need fsync too.
+static void write_row(std::ofstream& f, const Row& r) {
+  f << r.size << "," << r.mode << "," << r.warm_ms << "," << r.achieved_gflops << ","
+    << r.h2d_gbps << "," << r.d2h_gbps << "\n";
+  f.flush();
+}
+
+static void bench_size(int size, std::ofstream& csv) {
   int M = size, K = size, N = size;
   size_t a_n = (size_t)M * K, b_n = (size_t)K * N, c_n = (size_t)M * N;
 
-  std::vector<float> a_h(a_n), b_h(b_n), c_h(c_n);
+  std::vector<float> a_h(a_n), b_h(b_n);
   srand(0);
   for (auto& v : a_h) v = (float)rand() / RAND_MAX * 2.0f - 1.0f;
   for (auto& v : b_h) v = (float)rand() / RAND_MAX * 2.0f - 1.0f;
@@ -114,22 +127,27 @@ static void bench_size(int size, std::vector<Row>& rows) {
   double h2d_bytes = (double)(a_n + b_n) * sizeof(float);
   double h2d_gbps = h2d_bytes / ((t1 - t0) / 1000.0) / 1e9;
 
+  // Host input buffers aren't needed again after this point -- drop them
+  // before allocating c_h below, rather than holding 2 extra N*N host copies
+  // for the rest of bench_size. Mirrors the equivalent fix in
+  // tuned_matmul_bench.py's use of torch.from_numpy over torch.tensor().
+  std::vector<float>().swap(a_h);
+  std::vector<float>().swap(b_h);
+
   cublasHandle_t handle;
   CUBLAS_CHECK(cublasCreate(&handle));
-
   double flops = 2.0 * (double)M * K * N;
 
-  double ms_tf32 = timed_sgemm(handle, M, K, N, a_d, b_d, c_d, CUBLAS_COMPUTE_32F_FAST_TF32, 2);
-  double gflops_tf32 = flops / (ms_tf32 / 1000.0) / 1e9;
-  rows.push_back({size, "tf32_tensorcore", ms_tf32, gflops_tf32, h2d_gbps, 0.0});
-  printf("  size=%6d mode=tf32_tensorcore  warm=%9.3fms  %9.2f GFLOPS\n", size, ms_tf32, gflops_tf32);
-
-  double ms_fp32 = timed_sgemm(handle, M, K, N, a_d, b_d, c_d, CUBLAS_COMPUTE_32F, 2);
-  double gflops_fp32 = flops / (ms_fp32 / 1000.0) / 1e9;
-  rows.push_back({size, "plain_fp32", ms_fp32, gflops_fp32, h2d_gbps, 0.0});
-  printf("  size=%6d mode=plain_fp32       warm=%9.3fms  %9.2f GFLOPS\n", size, ms_fp32, gflops_fp32);
-
-  // ---- D2H bandwidth ----
+  // ---- D2H bandwidth -- measured FIRST (moved up from the end of this
+  // function), using one throwaway TF32 GEMM just to populate c_d, so
+  // h2d_gbps/d2h_gbps are both already known before either real timed row is
+  // written below. ----
+  const float warmup_alpha = 1.0f, warmup_beta = 0.0f;
+  CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &warmup_alpha, b_d, CUDA_R_32F,
+                             N, a_d, CUDA_R_32F, K, &warmup_beta, c_d, CUDA_R_32F, N,
+                             CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  std::vector<float> c_h(c_n);
   CUDA_CHECK(cudaMemcpy(c_h.data(), c_d, c_n * sizeof(float), cudaMemcpyDeviceToHost));  // warm up
   CUDA_CHECK(cudaDeviceSynchronize());
   t0 = now_ms();
@@ -138,10 +156,18 @@ static void bench_size(int size, std::vector<Row>& rows) {
   t1 = now_ms();
   double d2h_bytes = (double)c_n * sizeof(float);
   double d2h_gbps = d2h_bytes / ((t1 - t0) / 1000.0) / 1e9;
-  for (auto& r : rows) {
-    if (r.size == size) r.d2h_gbps = d2h_gbps;
-  }
+  std::vector<float>().swap(c_h);  // also not needed again
   printf("  size=%6d H2D=%7.2f GB/s   D2H=%7.2f GB/s\n", size, h2d_gbps, d2h_gbps);
+
+  double ms_tf32 = timed_sgemm(handle, M, K, N, a_d, b_d, c_d, CUBLAS_COMPUTE_32F_FAST_TF32, 2);
+  double gflops_tf32 = flops / (ms_tf32 / 1000.0) / 1e9;
+  write_row(csv, {size, "tf32_tensorcore", ms_tf32, gflops_tf32, h2d_gbps, d2h_gbps});
+  printf("  size=%6d mode=tf32_tensorcore  warm=%9.3fms  %9.2f GFLOPS\n", size, ms_tf32, gflops_tf32);
+
+  double ms_fp32 = timed_sgemm(handle, M, K, N, a_d, b_d, c_d, CUBLAS_COMPUTE_32F, 2);
+  double gflops_fp32 = flops / (ms_fp32 / 1000.0) / 1e9;
+  write_row(csv, {size, "plain_fp32", ms_fp32, gflops_fp32, h2d_gbps, d2h_gbps});
+  printf("  size=%6d mode=plain_fp32       warm=%9.3fms  %9.2f GFLOPS\n", size, ms_fp32, gflops_fp32);
 
   CUBLAS_CHECK(cublasDestroy(handle));
   CUDA_CHECK(cudaFree(a_d));
@@ -213,19 +239,24 @@ int main(int argc, char** argv) {
   std::string csv_path = argc > 2 ? argv[2] : "tuned_matmul_cuda.csv";
 
   std::vector<int> sizes = parse_sizes_arg(sizes_arg);
-  std::vector<Row> rows;
 
+  // Open once, write the header immediately, and hand the stream down so each
+  // row lands on disk (flushed) as soon as it's measured -- see write_row().
+  std::ofstream csv(csv_path);
+  if (!csv) {
+    fprintf(stderr, "[Error] Could not open %s for writing.\n", csv_path.c_str());
+    return 1;
+  }
+  csv << "size,mode,warm_ms,achieved_gflops,h2d_gbps,d2h_gbps\n";
+  csv.flush();
+
+  int completed = 0;
   for (int size : sizes) {
     printf("\n=== size=%d ===\n", size);
-    bench_size(size, rows);
+    bench_size(size, csv);
+    completed++;
   }
 
-  std::ofstream f(csv_path);
-  f << "size,mode,warm_ms,achieved_gflops,h2d_gbps,d2h_gbps\n";
-  for (auto& r : rows) {
-    f << r.size << "," << r.mode << "," << r.warm_ms << "," << r.achieved_gflops << ","
-      << r.h2d_gbps << "," << r.d2h_gbps << "\n";
-  }
-  printf("\nSaved %zu rows to %s\n", rows.size(), csv_path.c_str());
+  printf("\nSaved rows for %d/%zu size(s) to %s\n", completed, sizes.size(), csv_path.c_str());
   return 0;
 }

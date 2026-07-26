@@ -110,15 +110,25 @@ def time_call(fn, warmups=1):
     return (t1 - t0) * 1000.0  # ms
 
 
-def bench_size(ttnn, torch, device, size, fidelities, grid_x, grid_y, rows, sync):
+def bench_size(ttnn, torch, device, size, fidelities, grid_x, grid_y, sync, write_row):
+    import gc
     import numpy as np
 
     m = k = n = size
     rng = np.random.default_rng(0)
     a_np = rng.uniform(-1, 1, size=(m, k)).astype(np.float32)
     b_np = rng.uniform(-1, 1, size=(k, n)).astype(np.float32)
-    a_t = torch.tensor(a_np, dtype=torch.float32)
-    b_t = torch.tensor(b_np, dtype=torch.float32)
+    # NOTE: torch.tensor(a_np, ...) COPIES the buffer; torch.from_numpy() aliases
+    # it (zero-copy). At the large end of this sweep that copy is the difference
+    # between ~2 host-RAM copies and ~4 of an N*N*4-byte matrix -- e.g. at
+    # N=34816 that's ~9.7GB vs ~19.4GB just for the two operands, on top of
+    # whatever ttnn/torch need on the device side. This was very likely why runs
+    # were dying (OOM-killed, no traceback, no partial CSV) right around
+    # N~34000-40000: the host process got killed before ever raising a catchable
+    # Python exception, so nothing here could have caught it either. Switching
+    # to from_numpy roughly halves the avoidable host-side footprint.
+    a_t = torch.from_numpy(a_np)
+    b_t = torch.from_numpy(b_np)
 
     # ---- H2D bandwidth (both operand matrices) ----
     # NOTE: ttnn dispatches ops asynchronously -- from_torch()/matmul() enqueue
@@ -146,6 +156,23 @@ def bench_size(ttnn, torch, device, size, fidelities, grid_x, grid_y, rows, sync
     t1 = time.perf_counter()
     h2d_bytes = (a_np.nbytes + b_np.nbytes)
     h2d_gbps = h2d_bytes / ((t1 - t0)) / 1e9
+
+    # ---- D2H bandwidth -- measured FIRST now (moved up from the end of this
+    # function) so h2d_gbps/d2h_gbps are both already known before we write any
+    # per-fidelity row below. That lets every row be written out immediately,
+    # complete, instead of the old approach of collecting all rows in memory and
+    # patching d2h_gbps in after the fact -- which only worked if the process
+    # survived to the very end. ----
+    out_dev = ttnn.matmul(a_dev, b_dev, dtype=ttnn.float32)
+    _ = ttnn.to_torch(out_dev)  # warm up
+    t0 = time.perf_counter()
+    out_np = ttnn.to_torch(out_dev)
+    t1 = time.perf_counter()
+    d2h_bytes = out_np.numpy().nbytes if hasattr(out_np, "numpy") else (m * n * 4)
+    d2h_gbps = d2h_bytes / (t1 - t0) / 1e9
+    ttnn.deallocate(out_dev)
+    del out_np
+    print(f"  size={size:6d} H2D={h2d_gbps:7.2f} GB/s   D2H={d2h_gbps:7.2f} GB/s")
 
     for fid_name, fid in fidelities:
         cfg = make_compute_kernel_config(ttnn, fid)
@@ -180,11 +207,11 @@ def bench_size(ttnn, torch, device, size, fidelities, grid_x, grid_y, rows, sync
                   f"exceeds 150% of this config's theoretical peak ({peak:.1f} GFLOPS) -- still suspect.",
                   file=sys.stderr)
 
-        rows.append({
+        write_row({
             "size": size, "fidelity": fid_name, "core_grid": f"{grid_x}x{grid_y}",
             "warm_ms": warm_ms, "achieved_gflops": achieved_gflops,
             "peak_gflops": peak, "pct_of_peak": pct_of_peak,
-            "h2d_gbps": h2d_gbps, "d2h_gbps": None,
+            "h2d_gbps": h2d_gbps, "d2h_gbps": d2h_gbps,
         })
         pct_str = f"{pct_of_peak:5.1f}%" if pct_of_peak is not None else "  n/a"
         print(f"  size={size:6d} fidelity={fid_name:6s} core_grid={grid_x}x{grid_y}  "
@@ -199,31 +226,21 @@ def bench_size(ttnn, torch, device, size, fidelities, grid_x, grid_y, rows, sync
     warm_ms_default = time_call(run_default, warmups=2)
     flops = 2.0 * m * k * n
     achieved_gflops_default = flops / (warm_ms_default / 1000.0) / 1e9
-    rows.append({
+    write_row({
         "size": size, "fidelity": "default(unconfigured)", "core_grid": "auto",
         "warm_ms": warm_ms_default, "achieved_gflops": achieved_gflops_default,
         "peak_gflops": None, "pct_of_peak": None,
-        "h2d_gbps": h2d_gbps, "d2h_gbps": None,
+        "h2d_gbps": h2d_gbps, "d2h_gbps": d2h_gbps,
     })
     print(f"  size={size:6d} fidelity=default(unconfigured) core_grid=auto     "
           f"warm={warm_ms_default:9.3f}ms  {achieved_gflops_default:9.2f} GFLOPS")
 
-    # ---- D2H bandwidth (result of the last matmul) ----
-    out_dev = ttnn.matmul(a_dev, b_dev, dtype=ttnn.float32)
-    _ = ttnn.to_torch(out_dev)  # warm up
-    t0 = time.perf_counter()
-    out_np = ttnn.to_torch(out_dev)
-    t1 = time.perf_counter()
-    d2h_bytes = out_np.numpy().nbytes if hasattr(out_np, "numpy") else (m * n * 4)
-    d2h_gbps = d2h_bytes / (t1 - t0) / 1e9
-    for r in rows:
-        if r["size"] == size and r["d2h_gbps"] is None:
-            r["d2h_gbps"] = d2h_gbps
-    print(f"  size={size:6d} H2D={h2d_gbps:7.2f} GB/s   D2H={d2h_gbps:7.2f} GB/s")
-
     ttnn.deallocate(a_dev)
     ttnn.deallocate(b_dev)
-    ttnn.deallocate(out_dev)
+    # Explicitly drop host-side references before the next (possibly much
+    # larger) size is generated, rather than waiting on refcounting/GC timing.
+    del a_np, b_np, a_t, b_t
+    gc.collect()
 
 
 def parse_sizes_file(path):
@@ -282,26 +299,43 @@ def main():
         ("HiFi4", ttnn.MathFidelity.HiFi4),
     ]
 
+    # Open the CSV ONCE, up front, and write+flush each row as soon as it's
+    # measured -- not just at the very end. Two full sweeps of this script have
+    # been killed mid-run (OOM, no traceback -- see bench_size's comment on
+    # torch.from_numpy) at sizes around ~34000-40000, and the old
+    # write-everything-at-the-end approach meant BOTH runs produced zero CSV
+    # rows despite having completed dozens of measurements. os.fsync per row
+    # would be safer still but is overkill here; flush() is enough to survive
+    # an OOM-kill (SIGKILL) or Ctrl-C, since the OS page cache holds the data
+    # independent of the killed process. It would NOT survive a hard power loss.
+    fieldnames = ["size", "fidelity", "core_grid", "warm_ms", "achieved_gflops",
+                  "peak_gflops", "pct_of_peak", "h2d_gbps", "d2h_gbps"]
+    csv_file = open(args.csv, "w", newline="")
+    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    writer.writeheader()
+    csv_file.flush()
+    row_count = 0
+
+    def write_row(row):
+        nonlocal row_count
+        writer.writerow(row)
+        csv_file.flush()
+        row_count += 1
+
     device = ttnn.open_device(device_id=args.device_id)
     try:
         grid_x, grid_y = get_core_grid(ttnn, device, args.core_grid_x, args.core_grid_y)
         print(f"Using core grid: {grid_x}x{grid_y} (pass --core-grid-x/-y to override)")
         sync = make_sync_fn(ttnn, device)
 
-        rows = []
         for size in sizes:
             print(f"\n=== size={size} ===")
-            bench_size(ttnn, torch, device, size, fidelities, grid_x, grid_y, rows, sync)
+            bench_size(ttnn, torch, device, size, fidelities, grid_x, grid_y, sync, write_row)
     finally:
+        csv_file.close()
         ttnn.close_device(device)
 
-    with open(args.csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["size", "fidelity", "core_grid", "warm_ms",
-                                                "achieved_gflops", "peak_gflops", "pct_of_peak",
-                                                "h2d_gbps", "d2h_gbps"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\nSaved {len(rows)} rows to {args.csv}")
+    print(f"\nSaved {row_count} rows to {args.csv}")
 
 
 if __name__ == "__main__":
