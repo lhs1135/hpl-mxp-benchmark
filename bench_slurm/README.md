@@ -1,8 +1,21 @@
-# bench_slurm — SLURM problem-size sweep for hpl-ai.py
+# bench_slurm — SLURM sweeps for hpl-ai.py
 
-`run_bench.py` sweeps [hpl-ai.py](../hpl-ai.py) over a list of problem sizes
-on a SLURM cluster, one backend (`cpu` / `gpu` / `tt`) at a time, and
-gathers the results into a single CSV once the job finishes.
+Two generators, both producing a self-contained `sbatch` script and
+submitting it:
+
+- **`run_bench.py`** — sweeps [hpl-ai.py](../hpl-ai.py) over a list of
+  problem sizes, one backend (`cpu` / `gpu` / `tt`) at a time.
+- **`run_fidelity_sweep.py`** — generates an sbatch job that runs
+  [sweep_fidelity.sh](sweep_fidelity.sh), which sweeps hpl-ai.py's
+  `--fidelity`/`--fp32-dest-acc`/`--packer-l1-acc` combinations (always
+  `--device ttnn`). See [Fidelity sweep](#fidelity-sweep-run_fidelity_sweeppy--sweep_fidelitysh)
+  below.
+
+## `run_bench.py`
+
+Sweeps [hpl-ai.py](../hpl-ai.py) over a list of problem sizes on a SLURM
+cluster, one backend (`cpu` / `gpu` / `tt`) at a time, and gathers the
+results into a single CSV once the job finishes.
 
 `tt` is this script's name for the Tenstorrent backend; it maps to
 hpl-ai.py's own `--device ttnn` flag — hpl-ai.py itself still calls it
@@ -157,6 +170,46 @@ repeats of the same `(backend, n)` when `--iterations` > 1. Note `backend`
 here is `tt`, the value hpl-ai.py itself reports as `device=ttnn` inside
 the metrics file (`ttnn`, not `tt`) — the CSV's own `backend` column always
 matches the filename/`--target`, not hpl-ai.py's internal device string.
+
+## Fidelity sweep (`run_fidelity_sweep.py` + `sweep_fidelity.sh`)
+
+`sweep_fidelity.sh` sweeps hpl-ai.py's `--fidelity` × `--fp32-dest-acc` ×
+`--packer-l1-acc` (4 × 2 × 2 = 16 combinations, plus a `default` baseline)
+for a list of sizes, always `--device ttnn` — writing
+`ttnn_{fidelity}_{fp32}_{packer}_{n}.txt` metrics files and its own
+`comparison.csv` directly (no separate `--summarize` step needed, unlike
+`run_bench.py`). `run_fidelity_sweep.py` is the sbatch generator for it —
+same resource line as `run_bench.py`'s `tt` target, since fidelity/core-grid/
+packer_l1 are TT-only concepts with no cpu/gpu equivalent.
+
+```bash
+python3 run_fidelity_sweep.py --sizes 1024,2048,4096
+python3 run_fidelity_sweep.py --sizes 1024,2048 --max-it 40 --repeats 5
+python3 run_fidelity_sweep.py --sizes 1024 --dry-run
+python3 run_fidelity_sweep.py --sizes 1024 --clean-tt ~/.cache/tenstorrent
+python3 run_fidelity_sweep.py --sizes 1024 --mail-user you@gatech.edu
+```
+
+### `--repeats N` (default 3) — ruling out kernel-cache cold start
+
+The on-disk kernel/program-config cache (see
+[Tenstorrent_Cache_Theory.md](../Tenstorrent_Cache_Theory.md) and
+[core_grid_experiment/Report.md](../core_grid_experiment/Report.md)) is
+keyed per `(shape, dtype, core_grid, program_config)` — and fidelity/
+fp32_dest_acc_en/packer_l1_acc are all part of the ttnn `program_config`.
+That means each of the 16 combinations is its own cache entry: the first
+time a given combination runs, it pays a one-time kernel-compile cost
+that has nothing to do with steady-state throughput, and a naive
+single-shot sweep would silently bake that cold-start cost into every
+combination's reported number.
+
+`--repeats` (passed through as `sweep_fidelity.sh`'s `REPEATS` env var)
+repeats **each combination** that many times — not the whole sweep as a
+unit — and keeps only the last repeat's result; earlier repeats overwrite
+the same metrics file in place and are discarded. This automates what
+was previously a manual "run it 3 times, throw away everything but the
+last" step. Pass `--repeats 1` to disable (single-shot, includes
+cold-start).
 
 ## Requirements
 

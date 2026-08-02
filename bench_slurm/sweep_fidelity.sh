@@ -16,10 +16,21 @@
 # 2 packer_l1_acc (on/off) = 16 tuned combinations per size, plus 1
 # 'default' (unconfigured) baseline row per size for comparison.
 #
+# Cache effects (see ../core_grid_experiment/Report.md /
+# Tenstorrent_Cache_Theory.md) are keyed per (shape, dtype, core_grid,
+# program_config) -- i.e. per COMBINATION here, not per whole-sweep run.
+# So the first invocation of a given combination pays a one-time kernel-
+# compile cost that has nothing to do with steady-state throughput, and
+# ruling that out means repeating each combination itself, not the sweep
+# as a whole. REPEATS (env var, default 1) repeats every combination that
+# many times and keeps only the LAST repeat's result -- earlier repeats
+# overwrite the same metrics file in place and are discarded.
+#
 # Usage:
 #   ./sweep_fidelity.sh                  # default sizes: 1024 2048 4096
 #   ./sweep_fidelity.sh 1024 2048
 #   MAX_IT=40 OUTDIR=my_results ./sweep_fidelity.sh
+#   REPEATS=3 ./sweep_fidelity.sh 1024   # rule out cache cold-start, keep only the 3rd run
 #
 # Requires: hpl-ai.py runnable with --device ttnn (torch/ttnn installed, a
 # Tenstorrent device reachable at device_id=0).
@@ -41,6 +52,7 @@ if [ ${#SIZES[@]} -eq 0 ]; then
 fi
 
 MAX_IT="${MAX_IT:-40}"
+REPEATS="${REPEATS:-1}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTDIR="${OUTDIR:-$SCRIPT_DIR/results/fidelity_sweep_$STAMP}"
 mkdir -p "$OUTDIR"
@@ -55,6 +67,7 @@ echo "Fidelities:    ${FIDELITIES[*]}"
 echo "fp32-dest-acc: ${FP32_ACC_OPTS[*]}"
 echo "packer-l1-acc: ${PACKER_L1_OPTS[*]}"
 echo "Runs per size: $(( ${#FIDELITIES[@]} * ${#FP32_ACC_OPTS[@]} * ${#PACKER_L1_OPTS[@]} + 1 )) (16 tuned + 1 default baseline)"
+echo "Repeats per combination: $REPEATS $([ "$REPEATS" -gt 1 ] && echo "(cold-start rule-out; only the last is kept)")"
 echo "Output dir:    $OUTDIR"
 echo
 
@@ -72,7 +85,16 @@ run_and_record() {  # run_and_record N FIDELITY FP32 PACKER METRICS_FILE [extra 
     local n="$1" fid="$2" fp32="$3" packer="$4" metrics_file="$5"
     shift 5
     echo "=== N=$n fidelity=$fid fp32_dest_acc=$fp32 packer_l1_acc=$packer ==="
-    python3 "$HPL_AI" "$n" "$MAX_IT" --device ttnn --metrics-file "$metrics_file" "$@"
+    # REPEATS>1: each repeat overwrites the same metrics_file in place, so
+    # only the LAST one survives -- this combination's (shape, dtype,
+    # core_grid, program_config) kernel cache is warmed by the earlier,
+    # discarded repeats. See the REPEATS note near the top of this file.
+    for rep in $(seq 1 "$REPEATS"); do
+        if [ "$REPEATS" -gt 1 ]; then
+            echo "  -- repeat $rep/$REPEATS --"
+        fi
+        python3 "$HPL_AI" "$n" "$MAX_IT" --device ttnn --metrics-file "$metrics_file" "$@"
+    done
     echo
 
     local lu strsm sgemm gf
