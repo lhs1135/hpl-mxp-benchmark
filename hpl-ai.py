@@ -31,6 +31,15 @@ Host  (Python + NumPy + SciPy, fp32/fp64):
   leading suspect for most of the 49-310x TT-vs-GPU gap this benchmark has
   shown, not a real hardware ceiling.
 
+  --fidelity {default,LoFi,HiFi2,HiFi3,HiFi4} controls the
+  ttnn compute_kernel_config passed to both matmul calls: 'default' (no
+  config at all, the original behavior) or an explicit MathFidelity, in
+  which case --fp32-dest-acc {on,off} and --packer-l1-acc {on,off} also
+  apply (a single ComputeKernelConfig object sets all three together —
+  mirrors tt_matmul.py's make_compute_kernel_config exactly). See
+  _resolve_compute_kernel_config and core_grid_experiment/sweep_fidelity.sh
+  for sweeping this against the real solver workload.
+
 Run with --help for CLI usage.
 """
 
@@ -296,6 +305,44 @@ def _resolve_core_grid(ttnn_mod, device, mode: str, x: int | None, y: int | None
     raise ValueError(f"unknown core-grid mode {mode!r}")
 
 
+def _resolve_compute_kernel_config(ttnn_mod, fidelity: str, fp32_dest_acc: str, packer_l1_acc: str):
+    """Returns a ttnn compute_kernel_config for --device ttnn matmul calls, or None.
+
+    None means "don't pass compute_kernel_config to ttnn.matmul at all" —
+    ttnn's own unconfigured default, i.e. sgetrf_nopiv_ttnn's original
+    behavior. Mirrors tt_matmul.py's make_compute_kernel_config exactly, so
+    the same fidelity/fp32_dest_acc_en/packer_l1_acc axes swept there can
+    be swept against the real solver workload too (see
+    core_grid_experiment/sweep_fidelity.sh).
+
+      fidelity        : 'default' -> None (see above); otherwise one of
+                        'LoFi'/'HiFi2'/'HiFi3'/'HiFi4' (ttnn.MathFidelity.*).
+      fp32_dest_acc,
+      packer_l1_acc   : 'on'/'off', only meaningful when fidelity is not
+                        'default' — a single ComputeKernelConfig object
+                        sets all three axes together, so there's no way to
+                        toggle these two independently of fidelity.
+
+    math_approx_mode is always False (max-precision path), matching
+    tt_matmul.py — not swept, since it wasn't asked for here.
+    """
+    if fidelity == "default":
+        return None
+    fidelity_map = {
+        "LoFi": ttnn_mod.MathFidelity.LoFi,
+        "HiFi2": ttnn_mod.MathFidelity.HiFi2,
+        "HiFi3": ttnn_mod.MathFidelity.HiFi3,
+        "HiFi4": ttnn_mod.MathFidelity.HiFi4,
+    }
+    cfg_cls = getattr(ttnn_mod, "BlackholeComputeKernelConfig", None) or ttnn_mod.WormholeComputeKernelConfig
+    return cfg_cls(
+        math_fidelity=fidelity_map[fidelity],
+        math_approx_mode=False,
+        fp32_dest_acc_en=(fp32_dest_acc == "on"),
+        packer_l1_acc=(packer_l1_acc == "on"),
+    )
+
+
 def _to_tt(arr: np.ndarray, device, dtype=None) -> "ttnn.Tensor":
     """numpy → contiguous torch → TTNN tile-layout tensor on device.
 
@@ -317,7 +364,7 @@ def _from_tt(tt: "ttnn.Tensor") -> np.ndarray:
     return ttnn.to_torch(tt).to(torch.float32).numpy()
 
 
-def sgetrf_nopiv_ttnn(A: np.ndarray, device, core_grid=None) -> dict[str, float]:
+def sgetrf_nopiv_ttnn(A: np.ndarray, device, core_grid=None, compute_kernel_config=None) -> dict[str, float]:
     """
     Blocked LU without pivoting, in-place on A (n×n numpy fp32 array).
 
@@ -344,6 +391,11 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device, core_grid=None) -> dict[str, float]
     path is the leading suspect for most of the 49-310x TT-vs-GPU gap seen
     in this solver's benchmark, not a real hardware ceiling.
 
+    compute_kernel_config: optional ttnn compute_kernel_config passed to
+    both ttnn.matmul calls (see _resolve_compute_kernel_config /
+    --fidelity/--fp32-dest-acc/--packer-l1-acc in main()). None (the
+    default) again reproduces the original, unconfigured behavior.
+
     Returns a dict of accumulated wall-clock seconds per phase.
     Note: TTNN dispatch may be async; device compute time that overlaps with
     subsequent host work surfaces in the d2h measurement (to_torch blocks until
@@ -352,7 +404,11 @@ def sgetrf_nopiv_ttnn(A: np.ndarray, device, core_grid=None) -> dict[str, float]
     """
     tm = dict(panel=0.0, inv=0.0, h2d=0.0, strsm=0.0, cast=0.0, sgemm=0.0, d2h=0.0)
     _t = time.perf_counter   # local alias to shorten call sites
-    matmul_kwargs = {"core_grid": core_grid} if core_grid is not None else {}
+    matmul_kwargs = {}
+    if core_grid is not None:
+        matmul_kwargs["core_grid"] = core_grid
+    if compute_kernel_config is not None:
+        matmul_kwargs["compute_kernel_config"] = compute_kernel_config
 
     n = A.shape[0]
     for j in range(0, n, NB):
@@ -669,6 +725,29 @@ plain fwrite/fread on either side, with no format translation.""",
         help="core grid height, required with --core-grid-mode custom.",
     )
     parser.add_argument(
+        "--fidelity", choices=["default", "LoFi", "HiFi2", "HiFi3", "HiFi4"], default="default",
+        help="ttnn MathFidelity for --device ttnn's matmul calls (default: "
+             "'default' — no compute_kernel_config at all, ttnn's own "
+             "unconfigured choice, the original behavior). Any other value "
+             "builds an explicit ComputeKernelConfig (mirrors tt_matmul.py's "
+             "make_compute_kernel_config) using --fp32-dest-acc/"
+             "--packer-l1-acc too — a single config object sets all three "
+             "together, they can't be toggled independently of fidelity. "
+             "Ignored for --device cpu/gpu.",
+    )
+    parser.add_argument(
+        "--fp32-dest-acc", choices=["on", "off"], default="on",
+        help="fp32_dest_acc_en for the ttnn ComputeKernelConfig (default: "
+             "on, matching tt_matmul.py's max-precision path). Only applied "
+             "when --fidelity is not 'default'.",
+    )
+    parser.add_argument(
+        "--packer-l1-acc", choices=["on", "off"], default="off",
+        help="packer_l1_acc for the ttnn ComputeKernelConfig (default: "
+             "off, matching tt_matmul.py). Only applied when --fidelity is "
+             "not 'default'.",
+    )
+    parser.add_argument(
         "--input-a", type=str, default=None, metavar="FILE",
         help="raw binary file: N*N float64 values, row-major. "
              "Overrides matgen(); N is inferred from the file size.",
@@ -699,6 +778,19 @@ plain fwrite/fread on either side, with no format translation.""",
             file=sys.stderr,
         )
 
+    if args.fidelity != "default" and args.device != "ttnn":
+        print(
+            f"warning: --fidelity {args.fidelity!r} given but --device is "
+            f"{args.device!r}, not ttnn — ignored.",
+            file=sys.stderr,
+        )
+    if args.fidelity == "default" and (args.fp32_dest_acc != "on" or args.packer_l1_acc != "off"):
+        print(
+            "warning: --fp32-dest-acc/--packer-l1-acc only apply when "
+            "--fidelity is not 'default' — ignored.",
+            file=sys.stderr,
+        )
+
     return args
 
 
@@ -723,6 +815,7 @@ def main() -> None:
 
     device = None
     core_grid = None
+    compute_kernel_config = None
     if args.device == "gpu":
         import torch
 
@@ -742,6 +835,15 @@ def main() -> None:
         )
         grid_label = f"{core_grid.x}x{core_grid.y}" if core_grid is not None else "ttnn default (unconfigured)"
         print(f"Core grid mode: {args.core_grid_mode} ({grid_label})")
+
+        compute_kernel_config = _resolve_compute_kernel_config(
+            ttnn, args.fidelity, args.fp32_dest_acc, args.packer_l1_acc
+        )
+        cfg_label = (
+            f"{args.fidelity} fp32_dest_acc_en={args.fp32_dest_acc} packer_l1_acc={args.packer_l1_acc}"
+            if compute_kernel_config is not None else "ttnn default (unconfigured)"
+        )
+        print(f"Compute kernel config: {cfg_label}")
 
     # ── Load A and b from file, or generate (fp64) ───────────────────────────
     if args.input_a:
@@ -773,7 +875,7 @@ def main() -> None:
     if args.device == "gpu":
         lu_tm = sgetrf_nopiv_gpu(sA, device)
     elif args.device == "ttnn":
-        lu_tm = sgetrf_nopiv_ttnn(sA, device, core_grid=core_grid)
+        lu_tm = sgetrf_nopiv_ttnn(sA, device, core_grid=core_grid, compute_kernel_config=compute_kernel_config)
     else:
         lu_tm = sgetrf_nopiv_cpu(sA)
     t_factor = time.perf_counter() - t0
@@ -861,6 +963,9 @@ def main() -> None:
         "nb": NB,
         "core_grid_mode": args.core_grid_mode if args.device == "ttnn" else "",
         "core_grid": (f"{core_grid.x}x{core_grid.y}" if core_grid is not None else "auto"),
+        "fidelity": args.fidelity if args.device == "ttnn" else "",
+        "fp32_dest_acc_en": (args.fp32_dest_acc if compute_kernel_config is not None else ""),
+        "packer_l1_acc": (args.packer_l1_acc if compute_kernel_config is not None else ""),
         "time_convert_single_ms": 1e3 * t_c1,
         "time_lu_factorization_ms": 1e3 * t_factor,
     }
